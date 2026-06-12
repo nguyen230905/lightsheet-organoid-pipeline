@@ -1,487 +1,460 @@
+#!/usr/bin/env python3
 """
-crop.py  —  Organoid Cropping for 2D lightsheet timelapse movies (.avi or .tif)
+crop.py — robust fixed-size cropping for 2D lightsheet AVI/TIFF timelapse movies.
 
-Strategy (adapted from LSTree crop_gui.py + link_crop_candidates logic):
-    1. Detect organoid bounding box in each frame via threshold + largest blob
-    2. Link/smooth boxes across time (prevent jitter, track growth)
-    3. Compute a single padded crop that contains the organoid in ALL frames
-       (so the output movie has a fixed size, matching LSTree's "movie crop")
-    4. Apply crop and save
+Main fixes compared with the uploaded Crop.py:
+1. Crop never changes intensities. The output AVI is clipped to 0–255, not min–max stretched.
+2. AVI is written as 3-channel BGR MJPG, avoiding grayscale-MJPG corruption/display artifacts.
+3. Crop detection is based on a stable temporal projection, not a noisy per-frame 85th percentile.
+4. Thresholding is done on positive pixels, which is safer for sparse black-background microscopy movies.
+5. Saves validation images, crop coordinates, and a report.
 
-Two modes:
-    --mode auto    : fully automatic, no interaction needed  (default)
-    --mode preview : saves a figure showing detected crops before applying
+Recommended use after the fixed registration + BGS steps:
+python3 src/lightsheet_pipeline/Crop.py \
+  --input result/bgs/0.45/bgsub_fixed.avi \
+  --output result/cropped/ \
+  --margin 100 \
+  --positive-percentile 55 \
+  --square
 
-Usage:
-    # Basic (auto, square crop with 10% margin)
-    python crop.py --input denoised.avi
-
-    # AVI or TIFF, custom margin and output
-    python crop.py --input denoised.tif --output results/ --margin 50
-
-    # Use a previously saved crop (to apply same crop to multiple positions)
-    python crop.py --input pos5_denoised.avi --crop-from pos10_crop.json
-
-    # Preview detected boxes before cropping
-    python crop.py --input denoised.avi --mode preview
-
-Dependencies:
-    pip install opencv-python scikit-image tifffile matplotlib numpy
+If you only want a preview:
+python3 src/lightsheet_pipeline/Crop.py --input movie.avi --output crop_preview --preview-only
 """
 
 import argparse
 import json
+from pathlib import Path
+import csv
+
 import cv2
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from pathlib import Path
-from scipy import ndimage
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# I/O helpers  (same as denoise.py)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------
+# IO
+# -----------------------------
 
-def load_movie(filepath: str):
-    p = Path(filepath)
-    if p.suffix.lower() in ('.tif', '.tiff'):
+def load_movie(path: str):
+    """Load AVI/TIFF as float32 array with shape (T, H, W)."""
+    p = Path(path)
+    ext = p.suffix.lower()
+    if ext in [".tif", ".tiff"]:
         import tifffile
-        arr = tifffile.imread(filepath).astype(np.float32)
+        arr = tifffile.imread(str(p))
+        arr = np.asarray(arr)
+        if arr.ndim == 2:
+            arr = arr[None, ...]
+        if arr.ndim == 4 and arr.shape[-1] in (1, 3, 4):
+            arr = arr[..., 0]
         if arr.ndim == 4 and arr.shape[1] == 1:
             arr = arr[:, 0]
-        elif arr.ndim == 4 and arr.shape[-1] == 1:
-            arr = arr[..., 0]
-        if arr.ndim == 2:
-            arr = arr[np.newaxis]
-        fps = 1.0
-        print(f"  Loaded TIFF: {arr.shape}")
-        return arr, fps
-    elif p.suffix.lower() == '.avi':
-        cap = cv2.VideoCapture(filepath)
-        fps = cap.get(cv2.CAP_PROP_FPS)
+        if arr.ndim != 3:
+            raise ValueError(f"Expected TIFF as (T,H,W), got {arr.shape}")
+        return arr.astype(np.float32), 1.0
+
+    if ext == ".avi":
+        cap = cv2.VideoCapture(str(p))
+        if not cap.isOpened():
+            raise IOError(f"Cannot open video: {path}")
+        fps = cap.get(cv2.CAP_PROP_FPS) or 4.0
         frames = []
         while True:
-            ret, f = cap.read()
-            if not ret: break
-            gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) if f.ndim == 3 else f
-            frames.append(gray.astype(np.float32))
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame.ndim == 3:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frames.append(frame.astype(np.float32))
         cap.release()
-        arr = np.stack(frames)
-        print(f"  Loaded AVI:  {arr.shape}  fps={fps}")
-        return arr, fps
-    else:
-        raise ValueError(f"Unsupported format: {p.suffix}")
+        if not frames:
+            raise ValueError(f"No frames read from {path}")
+        return np.stack(frames, axis=0), float(fps)
+
+    raise ValueError("Input must be .avi, .tif, or .tiff")
 
 
-def save_movie(frames: np.ndarray, path: str, fps: float = 4.0):
+def warn_if_suspicious_baseline(frames: np.ndarray):
+    """Warn when the input looks like a previously corrupted display movie."""
+    med = float(np.median(frames))
+    p01 = float(np.percentile(frames, 1))
+    nonzero = float((frames > 0).mean() * 100)
+    warnings = []
+    if med > 20 and nonzero > 50:
+        warnings.append(
+            "Input has a high nonzero baseline: median={:.2f}, p1={:.2f}, nonzero={:.2f}%. "
+            "For a black-background light-sheet movie this usually means you are cropping a display-normalized/corrupted AVI. "
+            "Use the fixed BGS output or a TIFF/raw stack instead.".format(med, p01, nonzero)
+        )
+    return warnings
+
+
+def to_uint8_preserve(frames: np.ndarray, clip_percentile: float = 99.9):
+    """
+    Convert to uint8 for AVI without per-frame/global min-max stretching.
+    If data are already in 0–255, preserve those values by clipping.
+    For larger-range data, scale once using a positive-pixel percentile for display only.
+    """
+    arr = np.nan_to_num(frames.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    if float(np.nanmax(arr)) <= 255.0 and float(np.nanmin(arr)) >= 0.0:
+        return np.clip(arr, 0, 255).astype(np.uint8)
+    pos = arr[arr > 0]
+    hi = float(np.percentile(pos, clip_percentile)) if pos.size else 1.0
+    hi = max(hi, 1.0)
+    return (np.clip(arr, 0, hi) / hi * 255.0).astype(np.uint8)
+
+
+def save_movie(frames: np.ndarray, path: str, fps: float = 4.0, clip_percentile: float = 99.9):
+    """Save TIFF or AVI. AVI is BGR MJPG for robust OpenCV/Fiji playback."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    if p.suffix.lower() in ('.tif', '.tiff'):
+    ext = p.suffix.lower()
+
+    if ext in [".tif", ".tiff"]:
         import tifffile
-        tifffile.imwrite(str(p), frames.astype(np.float32), imagej=True)
-        print(f"  Saved TIFF: {p}")
-    elif p.suffix.lower() == '.avi':
-        T, H, W = frames.shape
-        mn, mx = frames.min(), frames.max()
-        u8 = ((frames - mn) / (mx - mn + 1e-8) * 255).astype(np.uint8)
-        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-        writer = cv2.VideoWriter(str(p), fourcc, fps, (W, H), isColor=False)
-        for f in u8:
-            writer.write(f)
-        writer.release()
-        print(f"  Saved AVI:  {p}")
+        tifffile.imwrite(str(p), frames.astype(np.float32), imagej=True, metadata={"axes": "TYX"})
+        print(f"Saved TIFF: {p}")
+        return
+
+    if ext != ".avi":
+        raise ValueError("Output must be .avi, .tif, or .tiff")
+
+    u8 = to_uint8_preserve(frames, clip_percentile=clip_percentile)
+    t, h, w = u8.shape
+    writer = cv2.VideoWriter(str(p), cv2.VideoWriter_fourcc(*"MJPG"), float(fps), (w, h), isColor=True)
+    if not writer.isOpened():
+        raise IOError(f"Could not open VideoWriter for {path}")
+    for fr in u8:
+        writer.write(cv2.cvtColor(fr, cv2.COLOR_GRAY2BGR))
+    writer.release()
+    print(f"Saved AVI: {p}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Organoid detection
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------
+# Crop detection
+# -----------------------------
 
-def detect_organoid_bbox(frame: np.ndarray,
-                         threshold_pct: float = 85.0,
-                         min_area_frac: float = 0.001) -> tuple:
+def disk_kernel(radius: int):
+    radius = max(1, int(radius))
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+
+
+def robust_display(frame: np.ndarray):
+    """Normalize for PNG visualization only. Does not affect saved movie."""
+    fr = frame.astype(np.float32)
+    pos = fr[fr > 0]
+    if pos.size == 0:
+        return np.zeros_like(fr, dtype=np.float32)
+    hi = float(np.percentile(pos, 99.5))
+    return np.clip(fr / (hi + 1e-8), 0, 1)
+
+
+def make_temporal_projection(frames: np.ndarray, projection: str = "p95"):
+    if projection == "max":
+        return np.max(frames, axis=0).astype(np.float32)
+    if projection == "mean":
+        return np.mean(frames, axis=0).astype(np.float32)
+    if projection.startswith("p"):
+        pct = float(projection[1:])
+        return np.percentile(frames, pct, axis=0).astype(np.float32)
+    raise ValueError("projection must be max, mean, or pXX such as p95")
+
+
+def foreground_mask_from_projection(
+    projection: np.ndarray,
+    positive_percentile: float = 70.0,
+    min_area: int = 5000,
+    close_radius: int = 15,
+    dilate_radius: int = 25,
+):
     """
-    Detect the organoid bounding box in a single 2D frame.
-
-    Strategy:
-        1. Percentile threshold to create binary mask
-        2. Morphological closing to fill holes
-        3. Keep only the largest connected component (the organoid)
-        4. Return its bounding box (y0, x0, y1, x1)
-
-    Returns (y0, x0, y1, x1) or None if no object found.
+    Build organoid mask from a temporal projection.
+    Threshold is computed on positive pixels only, avoiding the common problem that the
+    85th percentile of a sparse black-background image is 0.
     """
-    H, W = frame.shape
-    min_area = int(H * W * min_area_frac)
+    proj = projection.astype(np.float32)
+    pos = proj[proj > 0]
+    if pos.size < 100:
+        thr = float(np.percentile(proj, 99))
+    else:
+        thr = float(np.percentile(pos, positive_percentile))
+    raw = (proj > thr).astype(np.uint8) * 255
 
-    # Threshold: everything above percentile = foreground
-    thresh = np.percentile(frame, threshold_pct)
-    binary = (frame > thresh).astype(np.uint8)
+    if close_radius > 0:
+        raw = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, disk_kernel(close_radius))
+    if dilate_radius > 0:
+        raw = cv2.dilate(raw, disk_kernel(dilate_radius))
+    raw = cv2.morphologyEx(raw, cv2.MORPH_OPEN, disk_kernel(2))
 
-    # Morphological closing to fill internal holes (organoid interior can be dark)
-    kernel_size = max(11, min(H, W) // 50)
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_DILATE, kernel)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(raw, connectivity=8)
+    clean = np.zeros_like(raw)
+    kept = []
+    for lab in range(1, num):
+        area = int(stats[lab, cv2.CC_STAT_AREA])
+        if area >= min_area:
+            kept.append((area, lab))
+    if not kept and num > 1:
+        # Fallback: keep largest component if the area cutoff was too strict.
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        lab = 1 + int(np.argmax(areas))
+        kept = [(int(stats[lab, cv2.CC_STAT_AREA]), lab)]
+    for _, lab in kept:
+        clean[labels == lab] = 255
 
-    # Label connected components
-    labeled, n_labels = ndimage.label(binary)
-    if n_labels == 0:
-        return None
+    if clean.sum() == 0:
+        raise RuntimeError("Could not detect foreground mask. Try lowering --positive-percentile or --min-area.")
 
-    # Keep largest component
-    sizes = ndimage.sum(binary, labeled, range(1, n_labels + 1))
-    largest_label = np.argmax(sizes) + 1
-    if sizes[largest_label - 1] < min_area:
-        return None
-
-    mask = (labeled == largest_label)
-    rows = np.where(mask.any(axis=1))[0]
-    cols = np.where(mask.any(axis=0))[0]
-    return int(rows[0]), int(cols[0]), int(rows[-1]), int(cols[-1])
-
-
-def detect_all_bboxes(frames: np.ndarray,
-                      threshold_pct: float = 85.0) -> list:
-    """
-    Detect organoid bounding box in every frame.
-    Returns list of (y0, x0, y1, x1) tuples, None where detection failed.
-    """
-    bboxes = []
-    n = len(frames)
-    for i, frame in enumerate(frames):
-        if i % max(1, n // 5) == 0:
-            print(f"  Detecting organoid: frame {i}/{n-1}")
-        bbox = detect_organoid_bbox(frame, threshold_pct=threshold_pct)
-        bboxes.append(bbox)
-
-    n_detected = sum(1 for b in bboxes if b is not None)
-    print(f"  Detected organoid in {n_detected}/{n} frames")
-    return bboxes
+    return clean.astype(bool), thr, raw.astype(bool)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Crop linking (temporal smoothing)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def link_bboxes(bboxes: list, frames_shape: tuple,
-                margin: int = 30,
-                smooth_sigma: float = 2.0) -> dict:
-    """
-    Link detected bounding boxes across time.
-
-    Inspired by LSTree's link_crop_candidates:
-        - Interpolates over failed detections
-        - Temporally smooths the box coordinates (prevents jitter)
-        - Adds a margin around each box
-        - Computes a single "movie-wide" crop = union of all per-frame boxes
-          (same concept as LSTree's x_start_movie / x_stop_movie)
-
-    Returns a dict with:
-        per_frame  : list of (y0, x0, y1, x1) per frame (smoothed + margin)
-        movie_crop : (y0, x0, y1, x1) global crop covering all frames
-    """
-    from scipy.ndimage import gaussian_filter1d
-
-    T, H, W = frames_shape
-    n = len(bboxes)
-
-    # Extract coordinate arrays, handle None (failed detections)
-    y0_arr = np.array([b[0] if b else np.nan for b in bboxes], dtype=float)
-    x0_arr = np.array([b[1] if b else np.nan for b in bboxes], dtype=float)
-    y1_arr = np.array([b[2] if b else np.nan for b in bboxes], dtype=float)
-    x1_arr = np.array([b[3] if b else np.nan for b in bboxes], dtype=float)
-
-    # Interpolate over NaNs (failed detections)
-    for arr in [y0_arr, x0_arr, y1_arr, x1_arr]:
-        nans = np.isnan(arr)
-        if nans.all():
-            continue
-        ok_idx = np.where(~nans)[0]
-        arr[nans] = np.interp(np.where(nans)[0], ok_idx, arr[ok_idx])
-
-    # Temporal smoothing (Gaussian) — prevents jitter between frames
-    if smooth_sigma > 0:
-        y0_arr = gaussian_filter1d(y0_arr, smooth_sigma)
-        x0_arr = gaussian_filter1d(x0_arr, smooth_sigma)
-        y1_arr = gaussian_filter1d(y1_arr, smooth_sigma)
-        x1_arr = gaussian_filter1d(x1_arr, smooth_sigma)
-
-    # Add margin and clip to image bounds
-    y0_m = np.clip(np.floor(y0_arr - margin).astype(int), 0, H - 1)
-    x0_m = np.clip(np.floor(x0_arr - margin).astype(int), 0, W - 1)
-    y1_m = np.clip(np.ceil( y1_arr + margin).astype(int), 0, H - 1)
-    x1_m = np.clip(np.ceil( x1_arr + margin).astype(int), 0, W - 1)
-
-    per_frame = list(zip(
-        y0_m.tolist(), x0_m.tolist(),
-        y1_m.tolist(), x1_m.tolist()
-    ))
-
-    # Movie-wide crop: union of all per-frame boxes
-    # (the organoid is always inside this fixed crop)
-    movie_y0 = int(min(y0_m))
-    movie_x0 = int(min(x0_m))
-    movie_y1 = int(max(y1_m))
-    movie_x1 = int(max(x1_m))
-
-    # Make square (optional, improves downstream analysis consistency)
-    ch = movie_y1 - movie_y0
-    cw = movie_x1 - movie_x0
-    if ch != cw:
-        side = max(ch, cw)
-        cy = (movie_y0 + movie_y1) // 2
-        cx = (movie_x0 + movie_x1) // 2
-        movie_y0 = max(0, cy - side // 2)
-        movie_y1 = min(H, cy + side // 2)
-        movie_x0 = max(0, cx - side // 2)
-        movie_x1 = min(W, cx + side // 2)
-
-    movie_crop = (movie_y0, movie_x0, movie_y1, movie_x1)
-
-    h_crop = movie_y1 - movie_y0
-    w_crop = movie_x1 - movie_x0
-    print(f"  Movie-wide crop: y=[{movie_y0},{movie_y1}]  x=[{movie_x0},{movie_x1}]  "
-          f"→ {w_crop}×{h_crop} px  "
-          f"({100*w_crop/W:.0f}% of original width)")
-
-    return {"per_frame": per_frame, "movie_crop": movie_crop}
+def bbox_from_mask(mask: np.ndarray):
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        raise RuntimeError("Empty mask")
+    return int(ys.min()), int(xs.min()), int(ys.max()) + 1, int(xs.max()) + 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Apply crop
-# ─────────────────────────────────────────────────────────────────────────────
+def expand_bbox(bbox, shape, margin: int = 80, square: bool = True, even: bool = True):
+    h, w = shape
+    y0, x0, y1, x1 = bbox
+    y0 -= margin; x0 -= margin; y1 += margin; x1 += margin
+    y0 = max(0, y0); x0 = max(0, x0); y1 = min(h, y1); x1 = min(w, x1)
 
-def apply_movie_crop(frames: np.ndarray, movie_crop: tuple) -> np.ndarray:
-    """Apply the fixed movie-wide crop to all frames."""
-    y0, x0, y1, x1 = movie_crop
+    if square:
+        cy = (y0 + y1) / 2.0
+        cx = (x0 + x1) / 2.0
+        side = int(np.ceil(max(y1 - y0, x1 - x0)))
+        if even and side % 2 == 1:
+            side += 1
+        y0 = int(round(cy - side / 2)); y1 = y0 + side
+        x0 = int(round(cx - side / 2)); x1 = x0 + side
+        # Shift back into bounds while keeping size.
+        if y0 < 0:
+            y1 -= y0; y0 = 0
+        if x0 < 0:
+            x1 -= x0; x0 = 0
+        if y1 > h:
+            shift = y1 - h; y0 -= shift; y1 = h
+        if x1 > w:
+            shift = x1 - w; x0 -= shift; x1 = w
+        y0 = max(0, y0); x0 = max(0, x0)
+
+    if even:
+        if (y1 - y0) % 2 == 1 and y1 < h:
+            y1 += 1
+        elif (y1 - y0) % 2 == 1:
+            y0 = max(0, y0 - 1)
+        if (x1 - x0) % 2 == 1 and x1 < w:
+            x1 += 1
+        elif (x1 - x0) % 2 == 1:
+            x0 = max(0, x0 - 1)
+
+    if y1 <= y0 or x1 <= x0:
+        raise RuntimeError(f"Invalid crop: {(y0,x0,y1,x1)}")
+    return int(y0), int(x0), int(y1), int(x1)
+
+
+def apply_crop(frames: np.ndarray, crop):
+    y0, x0, y1, x1 = crop
     return frames[:, y0:y1, x0:x1].copy()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Validation / preview figure
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------
+# Validation outputs
+# -----------------------------
 
-def save_preview_figure(frames: np.ndarray,
-                        raw_bboxes: list,
-                        linked: dict,
-                        output_path: str):
-    """
-    Show detected (raw) and linked (smoothed) bounding boxes on representative frames,
-    plus the global movie crop rectangle.
-    """
-    n = len(frames)
-    movie_crop = linked["movie_crop"]
-    per_frame  = linked["per_frame"]
-    show_idx   = sorted(set([0, n//4, n//2, 3*n//4, n-1]))
-
-    def norm(x):
-        mn, mx = x.min(), x.max()
-        return (x - mn) / (mx - mn + 1e-8)
-
-    fig, axes = plt.subplots(1, len(show_idx), figsize=(4 * len(show_idx), 5))
-    if len(show_idx) == 1:
-        axes = [axes]
-
-    for col, idx in enumerate(show_idx):
-        ax = axes[col]
-        ax.imshow(norm(frames[idx]), cmap='gray', vmin=0, vmax=1)
-        ax.set_title(f'Frame {idx}', fontsize=9)
-        ax.axis('off')
-
-        # Raw detection box (per-frame, red dashed)
-        if raw_bboxes[idx] is not None:
-            y0r, x0r, y1r, x1r = raw_bboxes[idx]
-            ax.add_patch(patches.Rectangle(
-                (x0r, y0r), x1r - x0r, y1r - y0r,
-                edgecolor='red', facecolor='none', lw=1.5, ls='--',
-                label='Per-frame (raw)'))
-
-        # Smoothed + margin box (per-frame, orange)
-        y0s, x0s, y1s, x1s = per_frame[idx]
-        ax.add_patch(patches.Rectangle(
-            (x0s, y0s), x1s - x0s, y1s - y0s,
-            edgecolor='orange', facecolor='none', lw=1.5, ls='-',
-            label='Per-frame (smoothed+margin)'))
-
-        # Movie-wide crop (blue, same in every frame)
-        y0m, x0m, y1m, x1m = movie_crop
-        ax.add_patch(patches.Rectangle(
-            (x0m, y0m), x1m - x0m, y1m - y0m,
-            edgecolor='cyan', facecolor='none', lw=2, ls='-',
-            label='Movie crop'))
-
-    axes[0].legend(loc='lower left', fontsize=7,
-                   handles=[
-                       patches.Patch(edgecolor='red',    fc='none', label='Raw detection'),
-                       patches.Patch(edgecolor='orange', fc='none', label='Smoothed+margin'),
-                       patches.Patch(edgecolor='cyan',   fc='none', label='Movie crop'),
-                   ])
-
-    plt.suptitle('Crop detection preview\n'
-                 'red=raw  orange=smoothed+margin  cyan=movie crop',
-                 fontsize=11, fontweight='bold')
-    plt.tight_layout(rect=[0, 0, 1, 0.93])
-    plt.savefig(output_path, dpi=130, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved: {output_path}")
+def movie_stats(frames: np.ndarray):
+    return {
+        "shape_T": int(frames.shape[0]),
+        "shape_H": int(frames.shape[1]),
+        "shape_W": int(frames.shape[2]),
+        "min": float(np.min(frames)),
+        "p01": float(np.percentile(frames, 1)),
+        "median": float(np.median(frames)),
+        "p95": float(np.percentile(frames, 95)),
+        "p995": float(np.percentile(frames, 99.5)),
+        "max": float(np.max(frames)),
+        "nonzero_percent": float((frames > 0).mean() * 100),
+    }
 
 
-def save_crop_comparison(frames_orig: np.ndarray,
-                         frames_cropped: np.ndarray,
-                         output_path: str):
-    """Before/after strip."""
-    n = len(frames_orig)
-    show_idx = sorted(set([0, n//4, n//2, 3*n//4, n-1]))
 
-    def norm(x):
-        mn, mx = x.min(), x.max()
-        return (x - mn) / (mx - mn + 1e-8)
-
-    fig, axes = plt.subplots(2, len(show_idx), figsize=(4 * len(show_idx), 8))
-    for col, idx in enumerate(show_idx):
-        axes[0, col].imshow(norm(frames_orig[idx]),    cmap='gray')
-        axes[1, col].imshow(norm(frames_cropped[idx]), cmap='gray')
-        axes[0, col].set_title(f'f{idx}', fontsize=8)
-        axes[0, col].axis('off'); axes[1, col].axis('off')
-    axes[0, 0].set_ylabel('Original',  fontsize=9, color='tomato')
-    axes[1, 0].set_ylabel('Cropped',   fontsize=9, color='steelblue')
-    plt.suptitle(f'Crop result  ({frames_orig.shape[2]}×{frames_orig.shape[1]} '
-                 f'→ {frames_cropped.shape[2]}×{frames_cropped.shape[1]})',
-                 fontsize=12, fontweight='bold')
-    plt.tight_layout(rect=[0, 0, 1, 0.97])
-    plt.savefig(output_path, dpi=130, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved: {output_path}")
+def draw_label(im, text, x=10, y=30):
+    out = im.copy()
+    cv2.putText(out, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1, cv2.LINE_AA)
+    return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main pipeline
-# ─────────────────────────────────────────────────────────────────────────────
+def as_bgr_display(frame):
+    u = (robust_display(frame) * 255).astype(np.uint8)
+    return cv2.cvtColor(u, cv2.COLOR_GRAY2BGR)
 
-def run(input_path, output_dir, margin, threshold_pct, smooth_sigma,
-        mode, crop_from, validate):
 
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    ext  = Path(input_path).suffix.lower()
-    stem = Path(input_path).stem
+def save_validation(frames, cropped, projection, mask, raw_mask, crop, outdir: Path, stem: str, warnings):
+    """Save validation outputs without matplotlib, to keep the script fast/headless-safe."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    t, h, w = frames.shape
+    y0, x0, y1, x1 = crop
 
-    print(f"\n{'='*55}")
-    print(f"  Organoid Cropping")
-    print(f"  Input:   {input_path}")
-    print(f"  Mode:    {mode}  |  margin={margin} px")
-    print(f"{'='*55}")
+    # 1) Projection overlay + masks
+    proj = as_bgr_display(projection)
+    cv2.rectangle(proj, (x0, y0), (x1 - 1, y1 - 1), (255, 255, 255), 4)
+    proj = draw_label(proj, "Projection + crop")
+    raw = cv2.cvtColor((raw_mask.astype(np.uint8) * 255), cv2.COLOR_GRAY2BGR)
+    raw = draw_label(raw, "Raw threshold mask")
+    clean = cv2.cvtColor((mask.astype(np.uint8) * 255), cv2.COLOR_GRAY2BGR)
+    clean = draw_label(clean, "Clean foreground mask")
+    # Resize masks/projection to common height for concatenation if needed
+    panel_h = min(900, h)
+    def resize_h(img):
+        scale = panel_h / img.shape[0]
+        return cv2.resize(img, (int(img.shape[1] * scale), panel_h), interpolation=cv2.INTER_AREA)
+    detection_panel = cv2.hconcat([resize_h(proj), resize_h(raw), resize_h(clean)])
+    cv2.imwrite(str(outdir / f"{stem}_crop_detection_overlay.png"), detection_panel)
 
-    # ── 1. Load ───────────────────────────────────────────────────────────────
-    print("\n[1/3] Loading...")
-    frames, fps = load_movie(input_path)
-    T, H, W = frames.shape
+    # 2) Before/cropped comparison grid
+    idxs = sorted(set([0, t//4, t//2, 3*t//4, t-1]))
+    rows = []
+    for idx in idxs:
+        before = as_bgr_display(frames[idx])
+        cv2.rectangle(before, (x0, y0), (x1 - 1, y1 - 1), (255, 255, 255), 4)
+        before = draw_label(before, f"Before frame {idx}")
+        after = as_bgr_display(cropped[idx])
+        after = draw_label(after, f"Cropped frame {idx}")
+        # Resize before to cropped height for side-by-side display
+        disp_h = min(600, before.shape[0], after.shape[0])
+        def rz(img):
+            scale = disp_h / img.shape[0]
+            return cv2.resize(img, (int(img.shape[1]*scale), disp_h), interpolation=cv2.INTER_AREA)
+        b = rz(before); a = rz(after)
+        # pad to same height
+        rows.append(cv2.hconcat([b, a]))
+    # pad rows to same width
+    max_w = max(r.shape[1] for r in rows)
+    padded = []
+    for r in rows:
+        if r.shape[1] < max_w:
+            pad = np.zeros((r.shape[0], max_w - r.shape[1], 3), dtype=np.uint8)
+            r = cv2.hconcat([r, pad])
+        padded.append(r)
+    grid = cv2.vconcat(padded)
+    cv2.imwrite(str(outdir / f"{stem}_before_after_crop_grid.png"), grid)
 
-    # ── 2. Detect / load crop ─────────────────────────────────────────────────
-    if crop_from:
-        # Load a crop JSON saved from a previous run (e.g. from pos10 → apply to pos3)
-        print(f"\n[2/3] Loading crop from {crop_from}...")
-        with open(crop_from) as f:
-            crop_data = json.load(f)
-        linked = crop_data
-        raw_bboxes = [None] * T
-        print(f"  Loaded movie crop: {linked['movie_crop']}")
+    before_stats = movie_stats(frames)
+    crop_stats = movie_stats(cropped)
+    summary = {
+        "crop_y0": y0,
+        "crop_x0": x0,
+        "crop_y1": y1,
+        "crop_x1": x1,
+        "crop_height": y1 - y0,
+        "crop_width": x1 - x0,
+        "area_fraction_percent": float(((y1-y0)*(x1-x0))/(h*w)*100),
+        "size_reduction_percent": float((1 - ((y1-y0)*(x1-x0))/(h*w))*100),
+        "before_median": before_stats["median"],
+        "cropped_median": crop_stats["median"],
+        "before_p95": before_stats["p95"],
+        "cropped_p95": crop_stats["p95"],
+        "before_nonzero_percent": before_stats["nonzero_percent"],
+        "cropped_nonzero_percent": crop_stats["nonzero_percent"],
+    }
+    with open(outdir / f"{stem}_crop_summary.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary.keys()))
+        writer.writeheader(); writer.writerow(summary)
+
+    report_lines = []
+    report_lines.append("Crop validation report")
+    report_lines.append("======================")
+    report_lines.append(f"Original shape: T={t}, H={h}, W={w}")
+    report_lines.append(f"Crop: y=[{y0},{y1}), x=[{x0},{x1}) -> {y1-y0} x {x1-x0} px")
+    report_lines.append(f"Area kept: {summary['area_fraction_percent']:.2f}%")
+    report_lines.append(f"Size reduction: {summary['size_reduction_percent']:.2f}%")
+    report_lines.append("")
+    report_lines.append("Intensity diagnostics:")
+    report_lines.append(f"  before median={before_stats['median']:.3f}, p95={before_stats['p95']:.3f}, nonzero={before_stats['nonzero_percent']:.2f}%")
+    report_lines.append(f"  cropped median={crop_stats['median']:.3f}, p95={crop_stats['p95']:.3f}, nonzero={crop_stats['nonzero_percent']:.2f}%")
+    report_lines.append("")
+    if warnings:
+        report_lines.append("Warnings:")
+        for wmsg in warnings:
+            report_lines.append(f"  - {wmsg}")
     else:
-        print("\n[2/3] Detecting organoid bounding boxes...")
-        raw_bboxes = detect_all_bboxes(frames, threshold_pct=threshold_pct)
-        linked = link_bboxes(raw_bboxes, frames.shape,
-                             margin=margin, smooth_sigma=smooth_sigma)
+        report_lines.append("Warnings: none")
+    report_lines.append("")
+    report_lines.append("Interpretation:")
+    report_lines.append("  A correct crop should reduce image size while preserving the organoid and preserving the original black background/intensity scale.")
+    report_lines.append("  Cropping itself should not turn median background to ~128. If that happens, the AVI writer or input movie is the problem.")
+    (outdir / f"{stem}_crop_validation_report.txt").write_text("\n".join(report_lines), encoding="utf-8")
 
-    # ── Preview (stop here if mode=preview) ───────────────────────────────────
-    if mode == "preview" and not crop_from:
-        print("\n[+] Saving preview figure (mode=preview)...")
-        preview_path = str(out / f"{stem}_crop_preview.png")
-        save_preview_figure(frames, raw_bboxes, linked, preview_path)
-        crop_json = str(out / f"{stem}_crop.json")
-        with open(crop_json, 'w') as f:
-            json.dump(linked, f, indent=2)
-        print(f"  Saved crop coordinates: {crop_json}")
-        print("\n  [preview mode] Check the figure, then re-run without --mode preview to apply crop.")
+def run(args):
+    outdir = Path(args.output)
+    outdir.mkdir(parents=True, exist_ok=True)
+    frames, fps = load_movie(args.input)
+    stem = Path(args.input).stem
+    warnings = warn_if_suspicious_baseline(frames)
+    for w in warnings:
+        print("WARNING:", w)
+    print(f"Loaded {args.input}: shape={frames.shape}, fps={fps:.2f}, median={np.median(frames):.2f}, nonzero={(frames>0).mean()*100:.2f}%")
+
+    projection = make_temporal_projection(frames, args.projection)
+    mask, thr, raw_mask = foreground_mask_from_projection(
+        projection,
+        positive_percentile=args.positive_percentile,
+        min_area=args.min_area,
+        close_radius=args.close_radius,
+        dilate_radius=args.dilate_radius,
+    )
+    raw_bbox = bbox_from_mask(mask)
+    crop = expand_bbox(raw_bbox, projection.shape, margin=args.margin, square=args.square, even=True)
+    cropped = apply_crop(frames, crop)
+    print(f"Detected threshold on positive projection pixels: {thr:.3f}")
+    print(f"Crop: y=[{crop[0]},{crop[2]}), x=[{crop[1]},{crop[3]}) -> {cropped.shape[2]} x {cropped.shape[1]} px")
+
+    linked = {
+        "input": str(args.input),
+        "projection": args.projection,
+        "positive_percentile": args.positive_percentile,
+        "threshold_value": float(thr),
+        "raw_bbox_y0_x0_y1_x1": list(raw_bbox),
+        "movie_crop_y0_x0_y1_x1": list(crop),
+        "square": bool(args.square),
+        "margin": int(args.margin),
+        "original_shape_T_H_W": list(frames.shape),
+        "cropped_shape_T_H_W": list(cropped.shape),
+    }
+    with open(outdir / f"{stem}_crop.json", "w", encoding="utf-8") as f:
+        json.dump(linked, f, indent=2)
+
+    save_validation(frames, cropped, projection, mask, raw_mask, crop, outdir, stem, warnings)
+    if args.preview_only:
+        print("Preview only: not saving cropped movie.")
         return
 
-    # ── 3. Apply crop ─────────────────────────────────────────────────────────
-    print("\n[3/3] Applying crop...")
-    movie_crop = tuple(linked["movie_crop"])
-    cropped = apply_movie_crop(frames, movie_crop)
-    print(f"  Output size: {cropped.shape[2]}×{cropped.shape[1]} px")
-
-    # Save
-    final_path = str(out / f"{stem}_cropped{ext}")
-    save_movie(cropped, final_path, fps)
-
-    # Always save TIFF copy
-    if ext != '.tif':
-        import tifffile
-        tif_path = str(out / f"{stem}_cropped.tif")
-        tifffile.imwrite(tif_path, cropped.astype(np.float32), imagej=True)
-        print(f"  Saved TIFF: {tif_path}")
-
-    # Save crop coordinates (reuse for other positions)
-    crop_json = str(out / f"{stem}_crop.json")
-    with open(crop_json, 'w') as f:
-        json.dump(linked, f, indent=2)
-    print(f"  Saved crop JSON: {crop_json}")
-
-    # Validation
-    if validate and not crop_from:
-        print("\n[+] Saving validation figures...")
-        save_preview_figure(frames, raw_bboxes, linked,
-                            str(out / f"{stem}_crop_detection.png"))
-        save_crop_comparison(frames, cropped,
-                             str(out / f"{stem}_crop_comparison.png"))
-
-    print(f"\n{'='*55}")
-    print("  Done.")
-    print(f"{'='*55}\n")
+    ext = Path(args.input).suffix.lower()
+    avi_path = outdir / f"{stem}_cropped_fixed.avi"
+    tif_path = outdir / f"{stem}_cropped_fixed.tif"
+    save_movie(cropped, str(avi_path), fps=fps, clip_percentile=args.clip_percentile)
+    if args.save_tiff:
+        save_movie(cropped, str(tif_path), fps=fps, clip_percentile=args.clip_percentile)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(description="Robust fixed-size crop for 2D lightsheet AVI/TIFF movies")
+    parser.add_argument("--input", required=True, help="Input AVI/TIFF movie")
+    parser.add_argument("--output", required=True, help="Output folder")
+    parser.add_argument("--projection", default="p95", help="Temporal projection for crop detection: p95, max, mean")
+    parser.add_argument("--positive-percentile", type=float, default=70.0, help="Threshold percentile computed on positive projection pixels")
+    parser.add_argument("--min-area", type=int, default=5000, help="Minimum connected-component area in pixels")
+    parser.add_argument("--close-radius", type=int, default=15, help="Morphological closing radius")
+    parser.add_argument("--dilate-radius", type=int, default=25, help="Mask dilation radius before bounding box")
+    parser.add_argument("--margin", type=int, default=80, help="Extra crop margin in pixels")
+    parser.add_argument("--square", action="store_true", help="Make the crop square")
+    parser.add_argument("--clip-percentile", type=float, default=99.9, help="Only used for AVI display scaling if input is >8-bit")
+    parser.add_argument("--save-tiff", action="store_true", help="Also save cropped TIFF")
+    parser.add_argument("--preview-only", action="store_true", help="Save validation/crop JSON only; do not save cropped movie")
+    args = parser.parse_args()
+    run(args)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Auto-crop organoid from 2D lightsheet timelapse"
-    )
-    parser.add_argument("--input",     required=True,
-                        help="Input .avi or .tif")
-    parser.add_argument("--output",    default="results/",
-                        help="Output folder  (default: results/)")
-    parser.add_argument("--margin",    type=int,   default=30,
-                        help="Margin around organoid in pixels  (default: 30)")
-    parser.add_argument("--threshold", type=float, default=85.0,
-                        help="Percentile threshold for organoid detection  (default: 85)")
-    parser.add_argument("--smooth",    type=float, default=2.0,
-                        help="Temporal Gaussian smoothing sigma for crop coordinates "
-                             "(default: 2.0, set 0 to disable)")
-    parser.add_argument("--mode",      default="auto",
-                        choices=["auto", "preview"],
-                        help="auto=apply crop directly  preview=save figure only  (default: auto)")
-    parser.add_argument("--crop-from", default=None,
-                        help="Path to a _crop.json file from a previous run. "
-                             "Apply the same crop to this movie (useful for batch consistency).")
-    parser.add_argument("--no-validate", action="store_true",
-                        help="Skip validation figures")
-    args = parser.parse_args()
-
-    run(
-        input_path   = args.input,
-        output_dir   = args.output,
-        margin       = args.margin,
-        threshold_pct= args.threshold,
-        smooth_sigma = args.smooth,
-        mode         = args.mode,
-        crop_from    = args.crop_from,
-        validate     = not args.no_validate,
-    )
+    main()

@@ -1,0 +1,2 @@
+crop_y0,crop_x0,crop_y1,crop_x1,crop_height,crop_width,area_fraction_percent,size_reduction_percent,before_median,cropped_median,before_p95,cropped_p95,before_nonzero_percent,cropped_nonzero_percent
+578,494,1688,1604,1110,1110,23.681770514590784,76.31822948540922,0.0,11.0,84.0,151.0,13.001288692578813,54.89998598106707

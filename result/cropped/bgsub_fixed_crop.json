@@ -1,0 +1,30 @@
+{
+  "input": "result/bgs/0.45/bgsub_fixed.avi",
+  "projection": "p95",
+  "positive_percentile": 55.0,
+  "threshold_value": 113.24998474121094,
+  "raw_bbox_y0_x0_y1_x1": [
+    702,
+    595,
+    1564,
+    1504
+  ],
+  "movie_crop_y0_x0_y1_x1": [
+    578,
+    494,
+    1688,
+    1604
+  ],
+  "square": true,
+  "margin": 100,
+  "original_shape_T_H_W": [
+    22,
+    2266,
+    2296
+  ],
+  "cropped_shape_T_H_W": [
+    22,
+    1110,
+    1110
+  ]
+}

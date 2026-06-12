@@ -1,0 +1,16 @@
+Crop validation report
+======================
+Original shape: T=22, H=2266, W=2296
+Crop: y=[578,1688), x=[494,1604) -> 1110 x 1110 px
+Area kept: 23.68%
+Size reduction: 76.32%
+
+Intensity diagnostics:
+  before median=0.000, p95=84.000, nonzero=13.00%
+  cropped median=11.000, p95=151.000, nonzero=54.90%
+
+Warnings: none
+
+Interpretation:
+  A correct crop should reduce image size while preserving the organoid and preserving the original black background/intensity scale.
+  Cropping itself should not turn median background to ~128. If that happens, the AVI writer or input movie is the problem.
