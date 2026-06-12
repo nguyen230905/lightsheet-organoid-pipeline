@@ -1,0 +1,17 @@
+How to choose a better background subtraction result
+=================================================
+
+Prefer the result that satisfies all of these:
+1. Background median/mean/p95 are low and background_black_pct is high.
+2. CNR_mean is higher than before.
+3. Foreground_p95 retention is not too low; as a rough guide, avoid <0.35 unless you intentionally want a very sparse signal.
+4. Sharpness retention is not too low; low sharpness means structures may be smoothed/erased.
+5. The removed-signal image should look like smooth background, not like the organoid/ring.
+6. Avoid outputs flagged as grey-baseline/artifact or background-not-clean.
+
+Summary flags:
+- before: OK / plausible
+- 1: OK / plausible
+- 0.75: OK / plausible
+
+Key metric table is in summary_comparison.csv.

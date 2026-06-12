@@ -1,0 +1,14 @@
+Registration validation report
+==============================
+frames: 22
+reference frame: 0
+input dtype: uint8
+input shape TYX: (22, 2266, 2296)
+mean before centre drift px: 110.562
+mean after centre drift px: 110.562
+max before centre drift px: 203.125
+max after centre drift px: 203.125
+tx range px: -0.000 to -0.000
+ty range px: -0.000 to -0.000
+phase response mean: 0.04905
+phase response min: -0.00435

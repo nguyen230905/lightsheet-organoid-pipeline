@@ -1,0 +1,78 @@
+DENOISING VALIDATION REPORT
+===========================
+
+Good denoising should reduce background/noise while keeping foreground intensity and sharpness.
+It should not turn the black background into a grey 128/129 baseline.
+
+Main changes from input -> denoised:
+- background std/noise: -0.24%
+- foreground mean: -0.04%
+- foreground p95: -0.53%
+- sharpness: -86.28%
+- CNR: 0.21%
+
+Raw metrics:
+
+[input]
+min: 0.0000
+median_all: 0.0000
+p95_all: 84.0000
+p99_all: 155.0000
+max: 254.0000
+nonzero_percent: 13.0013
+background_mean: 3.9043
+background_std_noise: 15.9589
+background_p95: 39.0000
+foreground_mean: 113.5135
+foreground_p95: 190.0000
+foreground_p99: 216.0000
+cnr: 6.8682
+sharpness_laplacian_var_fg: 304.3520
+
+[processed_input_after_optional_bg]
+min: 0.0000
+median_all: 0.0000
+p95_all: 84.0000
+p99_all: 155.0000
+max: 254.0000
+nonzero_percent: 13.0013
+background_mean: 3.9043
+background_std_noise: 15.9589
+background_p95: 39.0000
+foreground_mean: 113.5135
+foreground_p95: 190.0000
+foreground_p99: 216.0000
+cnr: 6.8682
+sharpness_laplacian_var_fg: 304.3520
+
+[denoised]
+min: 0.0000
+median_all: 0.0000
+p95_all: 84.0000
+p99_all: 155.0000
+max: 250.0000
+nonzero_percent: 13.0131
+background_mean: 3.9012
+background_std_noise: 15.9198
+background_p95: 39.0000
+foreground_mean: 113.4733
+foreground_p95: 189.0000
+foreground_p99: 214.0000
+cnr: 6.8827
+sharpness_laplacian_var_fg: 41.7477
+
+[final_output]
+min: 0.0000
+median_all: 0.0000
+p95_all: 84.0000
+p99_all: 155.0000
+max: 250.0000
+nonzero_percent: 13.0131
+background_mean: 3.9012
+background_std_noise: 15.9198
+background_p95: 39.0000
+foreground_mean: 113.4733
+foreground_p95: 189.0000
+foreground_p99: 214.0000
+cnr: 6.8827
+sharpness_laplacian_var_fg: 41.7477

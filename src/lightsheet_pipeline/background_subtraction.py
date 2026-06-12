@@ -1,497 +1,538 @@
 #!/usr/bin/env python3
 """
-background_subtraction_standalone.py
+background_subtraction.py
 
-Standalone background-subtraction + validation script for lightsheet microscopy movies.
+Robust background subtraction for light-sheet AVI/TIFF movies.
 
-What it does:
-1. Load an AVI or multi-page TIFF movie as (T, H, W)
-2. Estimate smooth background using Gaussian or temporal-percentile method
-3. Subtract background with adjustable strength
-4. Save the background-subtracted movie
-5. Automatically generate validation plots and CSV/TXT metrics comparing BEFORE vs AFTER
+Main fixes compared with the uploaded script:
+1) Do not use per-frame min-max or preprocessed display images for output.
+2) Write AVI as 3-channel BGR MJPG for better compatibility.
+3) Estimate smooth background from pixels outside the specimen mask, so the
+   organoid itself is not blurred into the background and subtracted away.
+4) Optionally subtract a residual baseline from background pixels per frame.
+5) Warn if the input movie already has a suspicious grey background, which is
+   usually inherited from the earlier registration/export problem.
 
-Typical use:
-python src/lightsheet_pipeline/backgroundsubtraction.py \
-  --input tests/result/pos3/registered_pos3.avi \
-  --output tests/result/bgsv1/registered_pos3_bgsub.avi \
-  --bg gaussian \
+Typical use after registration:
+python3 src/lightsheet_pipeline/background_subtraction.py \
+  --input result/registered/center_phase/pos3/registered_fixed.avi \
+  --output result/bgs/bgsub_fixed.avi \
+  --method masked_gaussian \
   --bg-sigma 120 \
-  --bg-downsample 8 \
-  --bg-alpha 0.25 \
-  --bg-offset 0
-  --mask-percentile 80 \
-  --mask-min-area 5000 \
-  --bg-exclusion-radius 30 \
-  --save-bg
-
-Good background subtraction should usually show:
-- background_mean decreases
-- background_std_noise decreases
-- background_nonzero_percent decreases
-- CNR increases
-- foreground_mean / foreground_p95 should not collapse too much
+  --mask-percentile 70 \
+  --mask-dilate 70 \
+  --bg-alpha 1 \
+  --auto-offset
 """
 
+from __future__ import annotations
+
 import argparse
-from pathlib import Path
 import csv
+from dataclasses import dataclass
+from pathlib import Path
+
 import cv2
 import numpy as np
 
 
-# -----------------------------
-# IO utilities
-# -----------------------------
+@dataclass
+class MovieInfo:
+    fps: float
+    source: str
 
-def load_movie(path: str):
-    """Load AVI or TIFF into float32 array with shape (T, H, W)."""
-    p = Path(path)
-    ext = p.suffix.lower()
 
-    if ext in [".tif", ".tiff"]:
+# ---------------------------------------------------------------------------
+# IO
+# ---------------------------------------------------------------------------
+
+def load_movie(path: str | Path) -> tuple[np.ndarray, MovieInfo]:
+    """Load AVI or TIFF as float32 array with shape (T, H, W)."""
+    path = Path(path)
+    ext = path.suffix.lower()
+
+    if ext in {".tif", ".tiff"}:
         import tifffile
-        arr = tifffile.imread(str(p)).astype(np.float32)
+        arr = tifffile.imread(str(path))
         if arr.ndim == 2:
-            arr = arr[None, ...]
-        if arr.ndim == 4 and arr.shape[-1] in [1, 3, 4]:
+            arr = arr[None]
+        # Drop color/channel dimension if this is an RGB/RGBA image stack.
+        if arr.ndim == 4 and arr.shape[-1] in (1, 3, 4):
             arr = arr[..., 0]
         if arr.ndim == 4 and arr.shape[1] == 1:
             arr = arr[:, 0]
         if arr.ndim != 3:
-            raise ValueError(f"Expected TIFF shape (T,H,W), got {arr.shape}")
-        return arr, 1.0
+            raise ValueError(f"Expected TIFF shape (T,H,W); got {arr.shape}")
+        return arr.astype(np.float32), MovieInfo(fps=1.0, source=str(path))
 
-    if ext == ".avi":
-        cap = cv2.VideoCapture(str(p))
-        if not cap.isOpened():
-            raise IOError(f"Cannot open video: {path}")
-        fps = cap.get(cv2.CAP_PROP_FPS) or 4.0
-        frames = []
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if frame.ndim == 3:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            frames.append(frame.astype(np.float32))
-        cap.release()
-        if not frames:
-            raise ValueError(f"No frames read from {path}")
-        return np.stack(frames, axis=0), fps
+    if ext != ".avi":
+        raise ValueError("Input must be .avi, .tif, or .tiff")
 
-    raise ValueError("Input must be .avi, .tif, or .tiff")
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise IOError(f"Cannot open video: {path}")
+
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 4.0)
+    frames: list[np.ndarray] = []
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if frame.ndim == 3:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frames.append(frame.astype(np.float32))
+    cap.release()
+
+    if not frames:
+        raise ValueError(f"No frames read from {path}")
+    return np.stack(frames, axis=0), MovieInfo(fps=fps, source=str(path))
 
 
-def save_movie_no_stretch(frames: np.ndarray, path: str, fps: float, clip_percentile: float = 99.9):
+def to_uint8_for_video(frames: np.ndarray, display_clip: float | None = None) -> np.ndarray:
     """
-    Save movie without per-frame min-max stretching.
-    This avoids making weak residual background look artificially bright.
-    """
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    ext = p.suffix.lower()
+    Convert to uint8 for AVI writing.
 
-    if ext in [".tif", ".tiff"]:
+    If data are already in 0..255, just clip. This preserves black background.
+    If data exceed 8-bit, use one global percentile scale, never per-frame scale.
+    """
+    frames = np.asarray(frames, dtype=np.float32)
+    finite = np.isfinite(frames)
+    if not finite.any():
+        raise ValueError("All output pixels are NaN/Inf")
+    frames = np.nan_to_num(frames, nan=0.0, posinf=0.0, neginf=0.0)
+
+    max_val = float(frames.max())
+    min_val = float(frames.min())
+    if min_val >= 0 and max_val <= 255 and display_clip is None:
+        return np.clip(frames, 0, 255).astype(np.uint8)
+
+    positive = frames[frames > 0]
+    if positive.size == 0:
+        return np.zeros(frames.shape, dtype=np.uint8)
+    hi = np.percentile(positive, display_clip if display_clip is not None else 99.9)
+    hi = max(float(hi), 1e-6)
+    return (np.clip(frames, 0, hi) / hi * 255).astype(np.uint8)
+
+
+def save_movie(frames: np.ndarray, path: str | Path, fps: float, display_clip: float | None = None):
+    """Save AVI or TIFF. AVI is written as BGR MJPG for viewer compatibility."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ext = path.suffix.lower()
+
+    if ext in {".tif", ".tiff"}:
         import tifffile
-        tifffile.imwrite(str(p), frames.astype(np.float32), imagej=True)
-        print(f"Saved TIFF: {p}")
+        tifffile.imwrite(str(path), frames.astype(np.float32), imagej=True, metadata={"axes": "TYX"})
+        print(f"Saved TIFF: {path}")
         return
 
     if ext != ".avi":
         raise ValueError("Output must be .avi, .tif, or .tiff")
 
-    t, h, w = frames.shape
-    max_value = float(np.nanmax(frames))
-    if max_value <= 255:
-        u8 = np.clip(frames, 0, 255).astype(np.uint8)
-    else:
-        positive = frames[frames > 0]
-        hi = np.percentile(positive, clip_percentile) if positive.size else 1.0
-        u8 = (np.clip(frames, 0, hi) / (hi + 1e-8) * 255).astype(np.uint8)
-
-    writer = cv2.VideoWriter(str(p), cv2.VideoWriter_fourcc(*"MJPG"), fps, (w, h), isColor=False)
+    u8 = to_uint8_for_video(frames, display_clip=display_clip)
+    t, h, w = u8.shape
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), float(fps), (w, h), isColor=True)
     if not writer.isOpened():
         raise IOError(f"Could not open VideoWriter for {path}")
     for frame in u8:
-        writer.write(frame)
+        writer.write(cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR))
     writer.release()
-    print(f"Saved AVI: {p}")
+    print(f"Saved AVI: {path}  shape={u8.shape}, range=({u8.min()}, {u8.max()})")
 
 
-# -----------------------------
-# Background subtraction
-# -----------------------------
+# ---------------------------------------------------------------------------
+# Masks and background estimation
+# ---------------------------------------------------------------------------
 
-def gaussian_background(frame: np.ndarray, sigma: float, downsample: int):
+def disk_kernel(radius: int) -> np.ndarray:
+    radius = max(1, int(radius))
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+
+
+def foreground_mask_from_frame(
+    frame: np.ndarray,
+    mask_percentile: float = 70.0,
+    min_area: int = 5000,
+    dilate_radius: int = 70,
+    max_mask_size: int = 768,
+) -> np.ndarray:
+    """Detect the specimen/bright object; returns boolean mask.
+
+    The mask is calculated on a downsampled copy for speed. This avoids very
+    slow full-resolution morphology with a large dilation kernel.
     """
-    Estimate slowly varying background by downsampling, applying large Gaussian blur,
-    then upsampling back. This is faster than blurring the full-resolution frame directly.
+    f0 = np.asarray(frame, dtype=np.float32)
+    h0, w0 = f0.shape
+    scale = min(1.0, float(max_mask_size) / float(max(h0, w0)))
+    if scale < 1.0:
+        f = cv2.resize(f0, (max(16, int(w0 * scale)), max(16, int(h0 * scale))), interpolation=cv2.INTER_AREA)
+    else:
+        f = f0
+
+    pos = f[f > 0]
+    if pos.size < 100:
+        return np.zeros(f0.shape, dtype=bool)
+
+    thr = float(np.percentile(pos, mask_percentile))
+    mask = (f > thr).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, disk_kernel(max(1, int(round(5 * scale)))))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, disk_kernel(max(1, int(round(2 * scale)))))
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    clean = np.zeros_like(mask)
+    min_area_scaled = max(20, int(round(min_area * scale * scale)))
+    for lab in range(1, n):
+        if stats[lab, cv2.CC_STAT_AREA] >= min_area_scaled:
+            clean[labels == lab] = 255
+
+    if clean.sum() == 0:
+        # Fallback: keep the largest component.
+        if n > 1:
+            largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            clean[labels == largest] = 255
+        else:
+            clean = mask
+
+    if dilate_radius > 0:
+        r = max(1, int(round(dilate_radius * scale)))
+        clean = cv2.dilate(clean, disk_kernel(r))
+
+    if scale < 1.0:
+        clean = cv2.resize(clean, (w0, h0), interpolation=cv2.INTER_NEAREST)
+    return clean.astype(bool)
+
+
+def stable_foreground_mask(
+    frames: np.ndarray,
+    mask_percentile: float,
+    min_area: int,
+    dilate_radius: int,
+) -> np.ndarray:
+    """Use a temporal projection to make one stable mask for all frames."""
+    projection = np.percentile(frames, 95, axis=0).astype(np.float32)
+    return foreground_mask_from_frame(
+        projection,
+        mask_percentile=mask_percentile,
+        min_area=min_area,
+        dilate_radius=dilate_radius,
+    )
+
+
+def masked_gaussian_background(
+    frame: np.ndarray,
+    specimen_mask: np.ndarray,
+    sigma: float,
+    downsample: int,
+) -> np.ndarray:
     """
+    Smooth background estimated only from non-specimen pixels.
+
+    This is the key improvement over directly blurring the raw frame: the bright
+    organoid does not get blurred into the background image and then subtracted
+    from itself.
+    """
+    h, w = frame.shape
+    downsample = max(1, int(downsample))
+    small_w = max(16, w // downsample)
+    small_h = max(16, h // downsample)
+
+    valid = (~specimen_mask).astype(np.float32)
+    num = frame.astype(np.float32) * valid
+
+    num_s = cv2.resize(num, (small_w, small_h), interpolation=cv2.INTER_AREA)
+    den_s = cv2.resize(valid, (small_w, small_h), interpolation=cv2.INTER_AREA)
+
+    small_sigma = max(1.0, float(sigma) / downsample)
+    num_blur = cv2.GaussianBlur(num_s, (0, 0), small_sigma)
+    den_blur = cv2.GaussianBlur(den_s, (0, 0), small_sigma)
+
+    bg_small = num_blur / (den_blur + 1e-6)
+    bg_pixels = frame[~specimen_mask]
+    fallback = float(np.median(bg_pixels)) if bg_pixels.size else 0.0
+    bg_small[den_blur < 1e-3] = fallback
+    bg = cv2.resize(bg_small, (w, h), interpolation=cv2.INTER_LINEAR)
+    return np.clip(bg, 0, None).astype(np.float32)
+
+
+def plain_gaussian_background(frame: np.ndarray, sigma: float, downsample: int) -> np.ndarray:
     h, w = frame.shape
     downsample = max(1, int(downsample))
     small_w = max(16, w // downsample)
     small_h = max(16, h // downsample)
     small = cv2.resize(frame.astype(np.float32), (small_w, small_h), interpolation=cv2.INTER_AREA)
     small_sigma = max(1.0, float(sigma) / downsample)
-    small_bg = cv2.GaussianBlur(small, (0, 0), small_sigma)
-    bg = cv2.resize(small_bg, (w, h), interpolation=cv2.INTER_LINEAR)
-    return bg.astype(np.float32)
+    bg_small = cv2.GaussianBlur(small, (0, 0), small_sigma)
+    return cv2.resize(bg_small, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
 
 
-def temporal_background(frames: np.ndarray, percentile: float):
-    """
-    Estimate background from low temporal percentile.
-    Warning: if your sample stays fixed after registration, temporal background may remove real signal.
-    """
-    return np.percentile(frames, percentile, axis=0).astype(np.float32)
-
-
-def subtract_background(frames: np.ndarray, args):
+def subtract_background(frames: np.ndarray, args) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
     x = frames.astype(np.float32)
-    bg_stack = None
+    fg_mask = stable_foreground_mask(
+        x,
+        mask_percentile=args.mask_percentile,
+        min_area=args.mask_min_area,
+        dilate_radius=args.mask_dilate,
+    )
+    bg_mask = ~fg_mask
 
-    if args.bg == "none":
-        corrected = x.copy()
+    corrected = np.empty_like(x, dtype=np.float32)
+    bg_stack = np.empty_like(x, dtype=np.float32) if args.save_bg else None
 
-    elif args.bg == "gaussian":
-        corrected = np.empty_like(x, dtype=np.float32)
-        bg_stack = np.empty_like(x, dtype=np.float32) if args.save_bg else None
+    if args.method == "none":
+        corrected[:] = x
+        if bg_stack is not None:
+            bg_stack[:] = 0
+    elif args.method == "temporal":
+        # Only safe when sample moves relative to camera. After registration it may remove real signal.
+        bg = np.percentile(x, args.temporal_percentile, axis=0).astype(np.float32)
+        corrected = x - float(args.bg_alpha) * bg[None]
+        if bg_stack is not None:
+            bg_stack[:] = bg[None]
+    else:
         for i, frame in enumerate(x):
             if i % max(1, len(x) // 5) == 0:
-                print(f"Estimating Gaussian background frame {i}/{len(x)-1}")
-            bg = gaussian_background(frame, args.bg_sigma, args.bg_downsample)
+                print(f"Estimating background frame {i}/{len(x)-1}")
+            if args.method == "masked_gaussian":
+                bg = masked_gaussian_background(frame, fg_mask, args.bg_sigma, args.bg_downsample)
+            elif args.method == "gaussian":
+                bg = plain_gaussian_background(frame, args.bg_sigma, args.bg_downsample)
+            else:
+                raise ValueError("Unknown method")
             corrected[i] = frame - float(args.bg_alpha) * bg
             if bg_stack is not None:
                 bg_stack[i] = bg
 
-    elif args.bg == "temporal":
-        bg = temporal_background(x, args.temporal_percentile)
-        corrected = x - float(args.bg_alpha) * bg
-        bg_stack = np.repeat(bg[None, :, :], len(x), axis=0) if args.save_bg else None
-        print(f"Temporal background p{args.temporal_percentile}: range=({bg.min():.1f}, {bg.max():.1f})")
-
+    # Remove a residual camera/export baseline from background pixels only.
+    offsets = []
+    if args.auto_offset:
+        for i in range(len(corrected)):
+            bg_vals = corrected[i][bg_mask]
+            offset = float(np.percentile(bg_vals, args.offset_percentile)) if bg_vals.size else 0.0
+            # Do not add intensity; only subtract positive residual baseline.
+            offset = max(0.0, offset)
+            corrected[i] -= offset
+            offsets.append(offset)
     else:
-        raise ValueError("--bg must be none, gaussian, or temporal")
+        corrected -= float(args.bg_offset)
+        offsets = [float(args.bg_offset)] * len(corrected)
 
-    corrected = corrected - float(args.bg_offset)
     corrected[corrected < 0] = 0
-    return corrected.astype(np.float32), bg_stack
+    return corrected.astype(np.float32), bg_stack, fg_mask
 
 
-# -----------------------------
-# Validation utilities
-# -----------------------------
+# ---------------------------------------------------------------------------
+# Validation / diagnostics
+# ---------------------------------------------------------------------------
 
-def robust_display(im: np.ndarray):
-    """Normalize image for visualization only."""
-    im = im.astype(np.float32)
-    pos = im[im > 0]
+def robust_display(frame: np.ndarray, percentile: float = 99.5) -> np.ndarray:
+    f = frame.astype(np.float32)
+    pos = f[f > 0]
     if pos.size == 0:
-        return np.zeros_like(im, dtype=np.float32)
-    hi = np.percentile(pos, 99.5)
-    return np.clip(im / (hi + 1e-8), 0, 1)
+        return np.zeros_like(f)
+    hi = max(float(np.percentile(pos, percentile)), 1e-6)
+    return np.clip(f / hi, 0, 1)
 
 
-def disk_kernel(radius: int):
-    radius = max(1, int(radius))
-    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
 
 
-def make_foreground_mask(movie: np.ndarray, percentile: float = 99.0, min_area: int = 500):
-    """
-    Build a stable foreground mask from the BEFORE movie.
-    Validation uses the same mask for before and after so metrics are comparable.
-    """
-    projection = np.percentile(movie, 95, axis=0).astype(np.float32)
-    pos = projection[projection > 0]
-    if pos.size < 100:
-        thr = float(np.percentile(projection, percentile))
-    else:
-        thr = float(np.percentile(pos, percentile))
-
-    raw_mask = (projection > thr).astype(np.uint8) * 255
-    raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, disk_kernel(3))
-    raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_OPEN, disk_kernel(1))
-
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(raw_mask, connectivity=8)
-    clean = np.zeros_like(raw_mask)
-    for lab in range(1, n):
-        if stats[lab, cv2.CC_STAT_AREA] >= min_area:
-            clean[labels == lab] = 255
-
-    if clean.sum() == 0:
-        # Fallback: use a less strict threshold
-        thr = float(np.percentile(pos, 95)) if pos.size else float(np.percentile(projection, 95))
-        clean = (projection > thr).astype(np.uint8) * 255
-
-    return clean.astype(bool)
+def preview_image(im: np.ndarray, max_side: int = 900) -> np.ndarray:
+    """Downsample large images for fast validation plotting only."""
+    im = np.asarray(im)
+    h, w = im.shape[:2]
+    scale = min(1.0, float(max_side) / float(max(h, w)))
+    if scale >= 1.0:
+        return im
+    return cv2.resize(im, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
 
 
-def summarize_one_movie(movie: np.ndarray, fg_mask: np.ndarray, bg_mask: np.ndarray, threshold_abs: float):
-    frame_rows = []
-    for i, frame in enumerate(movie):
+
+def robust_preview(im: np.ndarray, max_side: int = 900, percentile: float = 99.5) -> np.ndarray:
+    """Downsample first, then normalize for fast plotting."""
+    return robust_display(preview_image(im, max_side=max_side), percentile=percentile)
+
+def quick_stats(frames: np.ndarray) -> dict[str, float]:
+    arr = np.asarray(frames, dtype=np.float32)
+    return {
+        "min": float(arr.min()),
+        "max": float(arr.max()),
+        "mean": float(arr.mean()),
+        "median": float(np.median(arr)),
+        "p01": float(np.percentile(arr, 1)),
+        "p50": float(np.percentile(arr, 50)),
+        "p99": float(np.percentile(arr, 99)),
+        "nonzero_percent": float((arr > 0).mean() * 100),
+    }
+
+
+def summarize_regions(movie: np.ndarray, fg_mask: np.ndarray) -> dict[str, float]:
+    bg_mask = ~fg_mask
+    rows = []
+    for frame in movie:
         fg = frame[fg_mask]
         bg = frame[bg_mask]
-        if fg.size == 0 or bg.size == 0:
-            raise ValueError("Foreground/background masks are empty. Try changing --mask-percentile.")
-
-        bg_mean = float(np.mean(bg))
-        bg_std = float(np.std(bg))
-        fg_mean = float(np.mean(fg))
-        fg_p95 = float(np.percentile(fg, 95))
-        fg_p99 = float(np.percentile(fg, 99))
-        cnr = float((fg_mean - bg_mean) / (bg_std + 1e-8))
-        sbr = float((fg_mean + 1e-8) / (bg_mean + 1e-8))
-        bg_nonzero_pct = float(np.mean(bg > threshold_abs) * 100)
-
-        # Sharpness inside foreground: useful to detect over-smoothing / lost structure.
-        lap = cv2.Laplacian(frame.astype(np.float32), cv2.CV_32F)
-        sharpness = float(np.var(lap[fg_mask]))
-
-        frame_rows.append({
-            "frame": i,
+        bg_mean = float(bg.mean()) if bg.size else 0.0
+        bg_std = float(bg.std()) if bg.size else 0.0
+        fg_mean = float(fg.mean()) if fg.size else 0.0
+        fg_p95 = float(np.percentile(fg, 95)) if fg.size else 0.0
+        rows.append({
             "background_mean": bg_mean,
-            "background_std_noise": bg_std,
-            "background_nonzero_percent": bg_nonzero_pct,
+            "background_std": bg_std,
             "foreground_mean": fg_mean,
             "foreground_p95": fg_p95,
-            "foreground_p99": fg_p99,
-            "CNR": cnr,
-            "SBR": sbr,
-            "sharpness_laplacian_var_fg": sharpness,
+            "CNR": float((fg_mean - bg_mean) / (bg_std + 1e-8)),
         })
-
-    summary = {}
-    keys = [k for k in frame_rows[0].keys() if k != "frame"]
-    for k in keys:
-        summary[k] = float(np.median([r[k] for r in frame_rows]))
-    return summary, frame_rows
+    return {k: float(np.median([r[k] for r in rows])) for k in rows[0]}
 
 
-def write_csv(path: Path, rows):
-    if not rows:
-        return
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+def _u8_preview(im: np.ndarray, max_side: int = 700) -> np.ndarray:
+    """Fast uint8 preview for contact sheets."""
+    im_small = preview_image(im, max_side=max_side).astype(np.float32)
+    pos = im_small[im_small > 0]
+    if pos.size == 0:
+        return np.zeros(im_small.shape, dtype=np.uint8)
+    hi = max(float(np.percentile(pos, 99.5)), 1e-6)
+    return (np.clip(im_small / hi, 0, 1) * 255).astype(np.uint8)
 
 
-def validate_before_after(before: np.ndarray, after: np.ndarray, outdir: Path, name: str, args):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+def _label_panel(gray: np.ndarray, label: str) -> np.ndarray:
+    """Convert grayscale panel to BGR and add a readable label."""
+    bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    pad = 34
+    out = np.zeros((bgr.shape[0] + pad, bgr.shape[1], 3), dtype=np.uint8)
+    out[pad:] = bgr
+    cv2.putText(out, label, (8, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+    return out
 
+
+def save_validation(before: np.ndarray, after: np.ndarray, fg_mask: np.ndarray, outdir: Path, name: str):
+    """Save lightweight validation files without matplotlib."""
     outdir.mkdir(parents=True, exist_ok=True)
-
     n = min(len(before), len(after))
     before = before[:n]
     after = after[:n]
-
-    fg_mask = make_foreground_mask(before, percentile=args.mask_percentile, min_area=args.mask_min_area)
-    # Dilate foreground before defining background so edge pixels are not counted as background.
-    fg_dilated = cv2.dilate(fg_mask.astype(np.uint8) * 255, disk_kernel(args.bg_exclusion_radius)) > 0
-    bg_mask = ~fg_dilated
-
-    before_summary, before_rows = summarize_one_movie(before, fg_mask, bg_mask, args.threshold_abs)
-    after_summary, after_rows = summarize_one_movie(after, fg_mask, bg_mask, args.threshold_abs)
-
-    # Save frame-level metrics.
-    frame_rows = []
-    for rb, ra in zip(before_rows, after_rows):
-        row = {"frame": rb["frame"]}
-        for k, v in rb.items():
-            if k != "frame":
-                row[f"before_{k}"] = v
-        for k, v in ra.items():
-            if k != "frame":
-                row[f"after_{k}"] = v
-        frame_rows.append(row)
-    write_csv(outdir / f"{name}_frame_metrics.csv", frame_rows)
-
-    summary_rows = []
-    for metric in before_summary:
-        b = before_summary[metric]
-        a = after_summary[metric]
-        change = a - b
-        pct = (change / (abs(b) + 1e-8)) * 100
-        summary_rows.append({
-            "metric": metric,
-            "before_median": b,
-            "after_median": a,
-            "absolute_change": change,
-            "percent_change": pct,
-        })
-    write_csv(outdir / f"{name}_summary_metrics.csv", summary_rows)
-
-    # Human-readable report.
-    with open(outdir / f"{name}_validation_report.txt", "w") as f:
-        f.write(f"Validation report: {name}\n")
-        f.write("=" * 80 + "\n\n")
-        f.write("Interpretation for background subtraction:\n")
-        f.write("GOOD signs: background_mean down, background_std_noise down, background_nonzero_percent down, CNR up.\n")
-        f.write("BAD signs: foreground_mean/p95 collapse strongly, CNR down, or residual image shows organoid structure.\n\n")
-        for row in summary_rows:
-            f.write(
-                f"{row['metric']}: before={row['before_median']:.4f}, "
-                f"after={row['after_median']:.4f}, "
-                f"change={row['absolute_change']:.4f}, "
-                f"pct={row['percent_change']:.2f}%\n"
-            )
-
-    # Fixed masks visualization.
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    mid = n // 2
-    axes[0].imshow(robust_display(before[mid]), cmap="gray")
-    axes[0].set_title("Before middle frame")
-    axes[1].imshow(fg_mask, cmap="gray")
-    axes[1].set_title("Foreground mask used for metrics")
-    axes[2].imshow(bg_mask, cmap="gray")
-    axes[2].set_title("Background mask used for metrics")
-    for ax in axes:
-        ax.axis("off")
-    plt.tight_layout()
-    fig.savefig(outdir / f"{name}_fixed_masks.png", dpi=140)
-    plt.close(fig)
-
-    # Before / after panel.
     idxs = sorted(set([0, n // 4, n // 2, 3 * n // 4, n - 1]))
-    fig, axes = plt.subplots(len(idxs), 3, figsize=(14, 4 * len(idxs)))
-    if len(idxs) == 1:
-        axes = axes[None, :]
-    for r, idx in enumerate(idxs):
-        residual = before[idx] - after[idx]
+
+    rows = []
+    for idx in idxs:
+        removed = np.clip(before[idx] - after[idx], 0, None)
         panels = [
-            (before[idx], f"Before frame {idx}"),
-            (after[idx], f"After frame {idx}"),
-            (residual, "Removed signal: before - after"),
+            _label_panel(_u8_preview(before[idx]), f"Before frame {idx}"),
+            _label_panel(_u8_preview(after[idx]), f"After frame {idx}"),
+            _label_panel(_u8_preview(removed), "Removed signal"),
         ]
-        for c, (im, title) in enumerate(panels):
-            axes[r, c].imshow(robust_display(im), cmap="gray")
-            axes[r, c].set_title(title)
-            axes[r, c].axis("off")
-    plt.tight_layout()
-    fig.savefig(outdir / f"{name}_before_after_residual_panel.png", dpi=140)
-    plt.close(fig)
+        # Pad panels to same height before concatenation.
+        max_h = max(p.shape[0] for p in panels)
+        padded = []
+        for p in panels:
+            if p.shape[0] < max_h:
+                pad = np.zeros((max_h - p.shape[0], p.shape[1], 3), dtype=np.uint8)
+                p = np.vstack([p, pad])
+            padded.append(p)
+        rows.append(np.hstack(padded))
+    max_w = max(r.shape[1] for r in rows)
+    padded_rows = []
+    for r in rows:
+        if r.shape[1] < max_w:
+            pad = np.zeros((r.shape[0], max_w - r.shape[1], 3), dtype=np.uint8)
+            r = np.hstack([r, pad])
+        padded_rows.append(r)
+    contact = np.vstack(padded_rows)
+    cv2.imwrite(str(outdir / f"{name}_before_after_removed.png"), contact)
 
-    # Summary bar plot for most useful metrics.
-    metrics_to_plot = [
-        "background_mean",
-        "background_std_noise",
-        "background_nonzero_percent",
-        "foreground_mean",
-        "foreground_p95",
-        "CNR",
-        "SBR",
-        "sharpness_laplacian_var_fg",
+    # Mask check panel.
+    mid = n // 2
+    mask_preview = (preview_image(fg_mask.astype(np.float32), max_side=700) * 255).astype(np.uint8)
+    bg_preview = (preview_image((~fg_mask).astype(np.float32), max_side=700) * 255).astype(np.uint8)
+    mask_panels = [
+        _label_panel(_u8_preview(before[mid]), "Before middle frame"),
+        _label_panel(mask_preview, "Specimen mask excluded"),
+        _label_panel(bg_preview, "Background pixels used"),
     ]
-    x = np.arange(len(metrics_to_plot))
-    width = 0.38
-    fig, ax = plt.subplots(figsize=(16, 6))
-    ax.bar(x - width / 2, [before_summary[m] for m in metrics_to_plot], width, label="Before")
-    ax.bar(x + width / 2, [after_summary[m] for m in metrics_to_plot], width, label="After")
-    ax.set_xticks(x)
-    ax.set_xticklabels(metrics_to_plot, rotation=35, ha="right")
-    ax.set_title(f"Summary metrics: {name}")
-    ax.legend()
-    ax.grid(axis="y", alpha=0.25)
-    plt.tight_layout()
-    fig.savefig(outdir / f"{name}_summary_bar_metrics.png", dpi=140)
-    plt.close(fig)
+    max_h = max(p.shape[0] for p in mask_panels)
+    mask_panels = [np.vstack([p, np.zeros((max_h - p.shape[0], p.shape[1], 3), dtype=np.uint8)]) if p.shape[0] < max_h else p for p in mask_panels]
+    cv2.imwrite(str(outdir / f"{name}_mask_check.png"), np.hstack(mask_panels))
 
-    # Frame-wise trend plots.
-    trend_metrics = ["background_mean", "background_std_noise", "CNR", "foreground_p95"]
-    for metric in trend_metrics:
-        fig, ax = plt.subplots(figsize=(12, 5))
-        ax.plot([r["frame"] for r in before_rows], [r[metric] for r in before_rows], label="Before")
-        ax.plot([r["frame"] for r in after_rows], [r[metric] for r in after_rows], label="After")
-        ax.set_title(f"Frame-wise {metric}: {name}")
-        ax.set_xlabel("Frame")
-        ax.set_ylabel(metric)
-        ax.legend()
-        ax.grid(alpha=0.25)
-        plt.tight_layout()
-        fig.savefig(outdir / f"{name}_timeseries_{metric}.png", dpi=140)
-        plt.close(fig)
+    before_stats = quick_stats(before)
+    after_stats = quick_stats(after)
+    before_regions = summarize_regions(before, fg_mask)
+    after_regions = summarize_regions(after, fg_mask)
 
-    # Histograms for background and foreground pixels.
-    sample_frames = idxs
-    before_fg = np.concatenate([before[i][fg_mask].ravel() for i in sample_frames])
-    after_fg = np.concatenate([after[i][fg_mask].ravel() for i in sample_frames])
-    before_bg = np.concatenate([before[i][bg_mask].ravel() for i in sample_frames])
-    after_bg = np.concatenate([after[i][bg_mask].ravel() for i in sample_frames])
+    with open(outdir / f"{name}_summary.csv", "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["metric", "before", "after", "change"])
+        for k in before_stats:
+            writer.writerow([k, before_stats[k], after_stats[k], after_stats[k] - before_stats[k]])
+        for k in before_regions:
+            writer.writerow([k, before_regions[k], after_regions[k], after_regions[k] - before_regions[k]])
 
-    for region_name, bvals, avals in [
-        ("background", before_bg, after_bg),
-        ("foreground", before_fg, after_fg),
-    ]:
-        hi = np.percentile(np.concatenate([bvals, avals]), 99.5)
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.hist(bvals, bins=100, range=(0, hi), alpha=0.5, label="Before")
-        ax.hist(avals, bins=100, range=(0, hi), alpha=0.5, label="After")
-        ax.set_title(f"{region_name.capitalize()} intensity histogram: {name}")
-        ax.set_xlabel("Intensity")
-        ax.set_ylabel("Pixel count")
-        ax.legend()
-        plt.tight_layout()
-        fig.savefig(outdir / f"{name}_histogram_{region_name}.png", dpi=140)
-        plt.close(fig)
+    with open(outdir / f"{name}_report.txt", "w") as fh:
+        fh.write("Background subtraction validation report\n")
+        fh.write("========================================\n\n")
+        fh.write(f"Frames: {n}\n")
+        fh.write(f"Before quick stats: {before_stats}\n")
+        fh.write(f"After quick stats:  {after_stats}\n")
+        fh.write(f"Before region stats: {before_regions}\n")
+        fh.write(f"After region stats:  {after_regions}\n\n")
+        if before_stats["median"] > 50:
+            fh.write("WARNING: input movie median intensity is high. This usually means the input already has a grey-background export artifact. Use the fixed registered AVI as input if possible.\n")
 
-    print("\nValidation summary:")
-    for row in summary_rows:
-        print(f"  {row['metric']}: before={row['before_median']:.4f}, after={row['after_median']:.4f}, change={row['percent_change']:.2f}%")
-    print(f"\nSaved validation outputs to: {outdir}")
+    print(f"Saved validation to {outdir}")
 
 
-# -----------------------------
+def warn_about_input(frames: np.ndarray):
+    stats = quick_stats(frames)
+    print("Input stats:", stats)
+    if 80 <= stats["median"] <= 170 and stats["nonzero_percent"] > 50:
+        print("WARNING: input has a large grey baseline. This is usually inherited from the registration/export artifact, not true microscopy signal.")
+        print("Recommendation: rerun background subtraction on the fixed registered AVI, not on the old grey registered.avi.")
+
+
+# ---------------------------------------------------------------------------
 # Main
-# -----------------------------
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Standalone background subtraction + validation for lightsheet movies")
-    parser.add_argument("--input", required=True, help="Input registered movie: .avi/.tif/.tiff")
-    parser.add_argument("--output", required=True, help="Output background-subtracted movie: .avi/.tif/.tiff")
-    parser.add_argument("--outdir", default=None, help="Validation output folder. Default: output parent / validation_background")
+    parser = argparse.ArgumentParser(description="Robust background subtraction for lightsheet AVI/TIFF movies")
+    parser.add_argument("--input", required=True, help="Input movie: .avi/.tif/.tiff")
+    parser.add_argument("--output", required=True, help="Output movie: .avi/.tif/.tiff")
+    parser.add_argument("--outdir", default=None, help="Validation folder; default: output parent / validation_background")
 
-    # Background subtraction parameters.
-    parser.add_argument("--bg", default="gaussian", choices=["none", "gaussian", "temporal"])
-    parser.add_argument("--bg-sigma", type=float, default=120.0)
-    parser.add_argument("--bg-downsample", type=int, default=8)
-    parser.add_argument("--bg-alpha", type=float, default=0.45, help="Subtract strength. Lower = less aggressive; try 0.25-0.60")
-    parser.add_argument("--bg-offset", type=float, default=0.0, help="Constant subtracted after background subtraction")
+    parser.add_argument("--method", default="masked_gaussian", choices=["masked_gaussian", "gaussian", "temporal", "none"])
+    parser.add_argument("--bg-sigma", type=float, default=120.0, help="Scale of smooth background in pixels")
+    parser.add_argument("--bg-downsample", type=int, default=8, help="Speed-up factor for smooth background estimation")
+    parser.add_argument("--bg-alpha", type=float, default=1.0, help="Background subtraction strength")
     parser.add_argument("--temporal-percentile", type=float, default=2.0)
-    parser.add_argument("--save-bg", action="store_true", help="Save estimated background stack as TIFF")
 
-    # Saving / validation.
-    parser.add_argument("--clip-percentile", type=float, default=99.9)
+    parser.add_argument("--mask-percentile", type=float, default=70.0, help="Threshold among positive pixels for specimen mask")
+    parser.add_argument("--mask-min-area", type=int, default=5000)
+    parser.add_argument("--mask-dilate", type=int, default=70, help="Dilate specimen mask before background estimation")
+
+    parser.add_argument("--auto-offset", action="store_true", help="Subtract residual median baseline from background pixels per frame")
+    parser.add_argument("--offset-percentile", type=float, default=50.0)
+    parser.add_argument("--bg-offset", type=float, default=0.0, help="Manual offset if --auto-offset is not used")
+
+    parser.add_argument("--display-clip", type=float, default=None, help="Global percentile scaling for AVI only. Default keeps 0..255 raw values.")
+    parser.add_argument("--save-bg", action="store_true", help="Save estimated background as TIFF")
     parser.add_argument("--no-validate", action="store_true")
-    parser.add_argument("--name", default="background_subtraction")
-    parser.add_argument("--threshold-abs", type=float, default=3.0, help="Threshold for counting nonzero background noise")
-    parser.add_argument("--mask-percentile", type=float, default=99.0, help="Percentile for foreground mask from BEFORE movie")
-    parser.add_argument("--mask-min-area", type=int, default=500)
-    parser.add_argument("--bg-exclusion-radius", type=int, default=15, help="Dilate foreground this much before measuring background")
-
+    parser.add_argument("--name", default="background_subtraction_fixed")
     args = parser.parse_args()
 
-    output_path = Path(args.output)
-    outdir = Path(args.outdir) if args.outdir else output_path.parent / "validation_background"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output = Path(args.output)
+    outdir = Path(args.outdir) if args.outdir else output.parent / "validation_background"
 
-    before, fps = load_movie(args.input)
-    print(f"Loaded input: {args.input}")
-    print(f"Shape={before.shape}, fps={fps:.2f}, range=({before.min():.1f}, {before.max():.1f}), nonzero={(before > 0).mean()*100:.2f}%")
+    before, info = load_movie(args.input)
+    print(f"Loaded {info.source}: shape={before.shape}, fps={info.fps:.3f}")
+    warn_about_input(before)
 
-    after, bg_stack = subtract_background(before, args)
-    print(f"After background subtraction: range=({after.min():.1f}, {after.max():.1f}), nonzero={(after > 0).mean()*100:.2f}%")
+    after, bg_stack, fg_mask = subtract_background(before, args)
+    print("After stats:", quick_stats(after))
 
-    save_movie_no_stretch(after, str(output_path), fps, args.clip_percentile)
-
+    save_movie(after, output, fps=info.fps, display_clip=args.display_clip)
     if args.save_bg and bg_stack is not None:
-        save_movie_no_stretch(bg_stack, str(output_path.with_name(output_path.stem + "_estimated_background.tif")), fps, args.clip_percentile)
+        save_movie(bg_stack, output.with_name(output.stem + "_estimated_background.tif"), fps=info.fps)
 
     if not args.no_validate:
-        validate_before_after(before, after, outdir, args.name, args)
+        save_validation(before, after, fg_mask, outdir, args.name)
 
 
 if __name__ == "__main__":

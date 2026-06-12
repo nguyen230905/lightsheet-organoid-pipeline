@@ -1,0 +1,9 @@
+Background subtraction validation report
+========================================
+
+Frames: 22
+Before quick stats: {'min': 0.0, 'max': 255.0, 'mean': 11.241198539733887, 'median': 0.0, 'p01': 0.0, 'p50': 0.0, 'p99': 169.0, 'nonzero_percent': 13.948180342035421}
+After quick stats:  {'min': 0.0, 'max': 253.6877899169922, 'mean': 10.798741340637207, 'median': 0.0, 'p01': 0.0, 'p50': 0.0, 'p99': 164.9159698486328, 'nonzero_percent': 13.673857894629426}
+Before region stats: {'background_mean': 1.742731511592865, 'background_std': 10.03267240524292, 'foreground_mean': 96.91149139404297, 'foreground_p95': 181.5, 'CNR': 9.144726756568115}
+After region stats:  {'background_mean': 1.6477745175361633, 'background_std': 9.602701663970947, 'foreground_mean': 93.82317733764648, 'foreground_p95': 177.09960174560547, 'CNR': 9.303111314945223}
+

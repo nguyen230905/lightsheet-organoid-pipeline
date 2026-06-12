@@ -1,0 +1,12 @@
+Registration validation report
+==============================
+frames: 22
+reference frame: 0
+input dtype: uint8
+input shape TYX: (22, 2266, 2296)
+mean before centre drift px: 110.562
+mean after centre drift px: 0.608
+max before centre drift px: 203.125
+max after centre drift px: 1.661
+tx range px: -2.966 to 96.336
+ty range px: -186.352 to 0.000
